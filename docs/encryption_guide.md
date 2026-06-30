@@ -143,41 +143,80 @@ flowchart TD
         $ keyctl pipe $(keyctl search @s user my_enc_key) | openssl aes-256-cbc -d -pass stdin -pbkdf2 -in encrypted_cdr.log.enc -out decrypted_cdr.log
         ```
 
-#### 5.3.2 대칭키 암호화 (Keyring 미지원 레거시 환경 - SHM 활용)
-HP-UX 등 Linux Kernel Keyring을 지원하지 않는 레거시 환경에서는 디스크 I/O를 최소화하고 메모리상에서 안전하게 키를 다루기 위해 **공유 메모리(SHM, tmpfs, `/dev/shm` 등)** 기반의 파일 시스템을 대체재로 활용할 수 있습니다.
+#### 5.3.2 대칭키 암호화 (Keyring 미지원 레거시 환경 - System V SHM 활용)
+HP-UX 등 Linux Kernel Keyring을 지원하지 않는 레거시 환경에서는 디스크 I/O를 최소화하고 메모리상에서 안전하게 키를 다루기 위해 **System V 공유 메모리(Shared Memory)** 를 활용할 수 있습니다.
 
-*   **SHM (Shared Memory) 활용 개념**: 부팅 또는 암호화 배치 수행 시 물리 디스크에 보관된 원본 키 파일을 메모리 기반 파일 시스템(SHM)으로 복사(Load)하고, 실제 암/복호화 시에는 SHM에 있는 키를 읽어서 OpenSSL로 전달합니다. 이 방식은 디스크 포렌식을 통한 키 유출을 방지하는 효과가 있습니다.
-*   **⚠️ [보안 주의사항 (Swap 메모리 및 권한)]**: 
-    1.  시스템 메모리가 부족할 경우 SHM 데이터가 물리 디스크의 Swap 영역으로 밀려나(Paging out) 평문으로 노출될 위험이 있습니다.
-    2.  SHM 환경에서도 일반 파일과 동일하게 OS 수준의 권한 통제를 받으므로, 복사된 키 파일 역시 **반드시 관리자(소유자)만 접근할 수 있도록 권한(chmod 400)을 엄격히 제한**해야 합니다.
-    3.  서버 재부팅 시 SHM은 초기화되므로 물리 디스크 안전한 경로에 원본 키 파일이 별도로 존재해야 합니다.
-*   **사용 예제 (SHM 키 적재 및 암복호화 적용)**:
+*   **System V SHM 활용 개념**: C 언어의 IPC(Inter-Process Communication) 함수인 `ftok`, `shmget`, `shmat` 등을 이용하여 공유 메모리 세그먼트를 생성하고, 부팅/배치 시 원본 키 파일에서 키를 읽어 해당 메모리에 적재(Load)합니다. 실제 암/복호화 작업 시에는 공유 메모리에서 키를 읽어와 OpenSSL 파이프라인으로 전달합니다. 
+*   **⚠️ [보안 주의사항 (권한 제어)]**: 공유 메모리 세그먼트 생성 시 `shmget` 함수에 `0600` 또는 `0400` 권한을 부여하여, 해당 프로세스를 실행하는 소유자(관리자)만 메모리에 접근할 수 있도록 OS 수준의 권한 통제를 엄격히 적용해야 합니다. 서버 재부팅 시 SHM은 초기화되므로 물리 디스크 안전한 경로에 원본 키 파일이 별도로 존재해야 합니다.
+*   **사용 예제 (C 프로그램 기반 SHM 키 적재 및 암복호화 적용)**:
     1.  **안전한 암호키 생성 및 원본 파일 저장 (초기 1회)**:
         ```bash
-        # 1) 32바이트 랜덤 키 생성 및 안전한 디렉토리에 원본 보관
+        # 32바이트 랜덤 키 생성 및 안전한 디렉토리에 원본 보관
         $ openssl rand -hex 32 > /secure_path/my_aes_key.txt
         $ chmod 400 /secure_path/my_aes_key.txt
         ```
-    2.  **부팅/배치 시 SHM 영역으로 키 적재 (메모리에 로드)**:
-        ```bash
-        # 1) 공유 메모리 영역(예: /dev/shm)으로 키 파일 복사
-        $ cp /secure_path/my_aes_key.txt /dev/shm/my_aes_key.txt
-        
-        # 2) SHM에 적재된 파일 역시 권한 제한 필수
-        $ chmod 400 /dev/shm/my_aes_key.txt
+    2.  **SHM 적재 및 출력 C 프로그램 작성 (`shm_key_util.c`)**:
+        ```c
+        #include <stdio.h>
+        #include <stdlib.h>
+        #include <string.h>
+        #include <sys/ipc.h>
+        #include <sys/shm.h>
+
+        #define SHM_SIZE 64
+        #define KEY_FILE "/secure_path/my_aes_key.txt"
+
+        int main(int argc, char *argv[]) {
+            if (argc < 2) {
+                printf("Usage: %s [load|read]\n", argv[0]);
+                return 1;
+            }
+
+            key_t key = ftok(KEY_FILE, 'R');
+            int shmid;
+            char *shm;
+
+            if (strcmp(argv[1], "load") == 0) {
+                // 1) SHM 생성 (소유자 읽기/쓰기 권한 0600)
+                shmid = shmget(key, SHM_SIZE, IPC_CREAT | 0600);
+                if (shmid == -1) { perror("shmget"); return 1; }
+                shm = shmat(shmid, NULL, 0);
+
+                // 2) 파일에서 키를 읽어 SHM에 복사
+                FILE *f = fopen(KEY_FILE, "r");
+                if (f) {
+                    fgets(shm, SHM_SIZE, f);
+                    fclose(f);
+                }
+                shmdt(shm);
+            } else if (strcmp(argv[1], "read") == 0) {
+                // 1) 기존 SHM 접근 (소유자 권한)
+                shmid = shmget(key, SHM_SIZE, 0600);
+                if (shmid == -1) { perror("shmget"); return 1; }
+                shm = shmat(shmid, NULL, SHM_RDONLY);
+
+                // 2) SHM에 있는 키를 표준 출력으로 전달
+                printf("%s", shm);
+                shmdt(shm);
+            }
+            return 0;
+        }
         ```
-    3.  **SHM에서 키를 읽어 OpenSSL 암/복호화**:
+    3.  **프로그램 컴파일 및 부팅 시 키 적재 (Load)**:
         ```bash
-        # 파이프라인(cat)을 통해 메모리에서 키를 읽어 openssl로 전달 (암호화)
-        $ cat /dev/shm/my_aes_key.txt | openssl aes-256-cbc -pass stdin -pbkdf2 -in plain_cdr.log -out encrypted_cdr.log.enc
+        # 컴파일 (HP-UX의 경우 cc 또는 gcc 사용)
+        $ gcc -o shm_key_util shm_key_util.c
+        
+        # 부팅 시 1회 실행하여 메모리에 키 적재
+        $ ./shm_key_util load
+        ```
+    4.  **SHM에서 키를 읽어 OpenSSL 암/복호화 (Read)**:
+        ```bash
+        # C 프로그램을 통해 메모리에서 키를 읽어 openssl로 전달 (암호화)
+        $ ./shm_key_util read | openssl aes-256-cbc -pass stdin -pbkdf2 -in plain_cdr.log -out encrypted_cdr.log.enc
         
         # (복호화)
-        $ cat /dev/shm/my_aes_key.txt | openssl aes-256-cbc -d -pass stdin -pbkdf2 -in encrypted_cdr.log.enc -out decrypted_cdr.log
-        ```
-    4.  **작업 종료 후 SHM 메모리에서 키 파기 (선택/권장)**:
-        ```bash
-        # 메모리 상의 키를 즉시 삭제 (옵션)
-        $ rm -f /dev/shm/my_aes_key.txt
+        $ ./shm_key_util read | openssl aes-256-cbc -d -pass stdin -pbkdf2 -in encrypted_cdr.log.enc -out decrypted_cdr.log
         ```
 
 #### 5.3.3 비대칭키 암호화 (GPG 활용)
