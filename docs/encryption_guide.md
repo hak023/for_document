@@ -110,8 +110,8 @@ flowchart TD
     end
 
     subgraph "3. 암/복호화 처리"
-        C -->|메모리에서 키 파이프라인 전달<br/>(keyctl pipe)| D("데이터 암호화<br/>(openssl aes-256-cbc -e)")
-        C -->|메모리에서 키 파이프라인 전달<br/>(keyctl pipe)| E("데이터 복호화<br/>(openssl aes-256-cbc -d)")
+        C -->|메모리에서 키 파이프라인 전달<br/>(keyctl pipe)| D["데이터 암호화<br/>(openssl aes-256-cbc -e)"]
+        C -->|메모리에서 키 파이프라인 전달<br/>(keyctl pipe)| E["데이터 복호화<br/>(openssl aes-256-cbc -d)"]
     end
 ```
 
